@@ -1,6 +1,8 @@
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
+const AWS = require('aws-sdk');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(express.json());
@@ -16,6 +18,9 @@ const APP_ID = 'wx6e1af3fa84fbe523';
 
 let authData = null;
 let cloudUrlsData = null;
+let refreshTokensData = null;
+let awsCredentials = null;
+let iotData = null;
 let saasToken = null;
 let tokenExpiry = 0;
 
@@ -23,15 +28,15 @@ function md5(input) {
   return crypto.createHash('md5').update(input, 'utf8').digest('hex');
 }
 
-function buildSignedHeaders(saasToken, countryAbbr) {
+function buildSignedHeaders(token, countryAbbr) {
   const timestamp = Date.now().toString();
   const nonce = Math.random().toString(36).substr(2, 16);
-  const sign = md5(timestamp + nonce + saasToken);
+  const sign = md5(timestamp + nonce + token);
   return {
     'platform': 'android',
     'appversion': '5.4.1',
     'thomeversion': '4.8.1',
-    'accesstoken': saasToken,
+    'accesstoken': token,
     'countrycode': countryAbbr || 'TR',
     'accept-language': 'en',
     'timestamp': timestamp,
@@ -70,8 +75,8 @@ async function getCloudUrls() {
   return cloudUrlsData;
 }
 
-async function getSaasToken() {
-  if (saasToken && Date.now() < tokenExpiry) return saasToken;
+async function getRefreshTokens() {
+  if (refreshTokensData && Date.now() < tokenExpiry) return refreshTokensData;
   if (!authData) await login();
   const urls = await getCloudUrls();
   const url = `${urls.cloud_url}/v3/auth/refresh_tokens`;
@@ -79,27 +84,67 @@ async function getSaasToken() {
   const headers = { 'user-agent': 'Android', 'content-type': 'application/json; charset=UTF-8', 'accept-encoding': 'gzip, deflate, br' };
   const res = await axios.post(url, payload, { headers });
   if (!res.data || res.data.code !== 0) throw new Error('Token alınamadı: ' + JSON.stringify(res.data));
+  refreshTokensData = res.data;
   saasToken = res.data.data.saasToken;
   tokenExpiry = Date.now() + 3500 * 1000;
   console.log('SaasToken alındı');
-  return saasToken;
+  return refreshTokensData;
+}
+
+async function getAwsCredentials() {
+  if (awsCredentials) return awsCredentials;
+  const tokens = await getRefreshTokens();
+  const urls = await getCloudUrls();
+  const region = urls.cloud_region;
+  const url = `https://cognito-identity.${region}.amazonaws.com/`;
+  const decoded = jwt.decode(tokens.data.cognitoToken, { complete: false });
+  const identityId = decoded.sub;
+  const payload = {
+    IdentityId: identityId,
+    Logins: { 'cognito-identity.amazonaws.com': tokens.data.cognitoToken }
+  };
+  const headers = {
+    'User-agent': 'aws-sdk-android/2.22.6 Linux/6.1.23-android14-4-00257-g7e35917775b8-ab9964412 Dalvik/2.1.0/0 en_US',
+    'X-Amz-Target': 'AWSCognitoIdentityService.GetCredentialsForIdentity',
+    'content-type': 'application/x-amz-json-1.1'
+  };
+  const res = await axios.post(url, payload, { headers });
+  awsCredentials = res.data;
+  console.log('AWS credentials alındı');
+  return awsCredentials;
+}
+
+async function getIotData() {
+  if (iotData) return iotData;
+  const creds = await getAwsCredentials();
+  const urls = await getCloudUrls();
+  const region = urls.cloud_region;
+  AWS.config.update({
+    region,
+    accessKeyId: creds.Credentials.AccessKeyId,
+    secretAccessKey: creds.Credentials.SecretKey,
+    sessionToken: creds.Credentials.SessionToken,
+  });
+  iotData = new AWS.IotData({ endpoint: `https://data-ats.iot.${region}.amazonaws.com` });
+  console.log('AWS IoT Data hazır');
+  return iotData;
+}
+
+async function sendCommand(deviceId, properties) {
+  const iot = await getIotData();
+  const topic = `$aws/things/${deviceId}/shadow/update`;
+  const payload = JSON.stringify({ state: { desired: properties } });
+  await iot.publish({ topic, payload, qos: 0 }).promise();
+  console.log('Komut gönderildi:', properties);
+  return { ok: true };
 }
 
 async function getDevices() {
   const urls = await getCloudUrls();
-  const token = await getSaasToken();
-  const headers = buildSignedHeaders(token, authData.user.countryAbbr);
+  const tokens = await getRefreshTokens();
+  const headers = buildSignedHeaders(tokens.data.saasToken, authData.user.countryAbbr);
   const url = `${urls.device_url}/v3/user/get_things`;
   const res = await axios.post(url, {}, { headers });
-  return res.data;
-}
-
-async function sendCommand(deviceId, properties) {
-  const urls = await getCloudUrls();
-  const token = await getSaasToken();
-  const headers = buildSignedHeaders(token, authData.user.countryAbbr);
-  const url = `${urls.device_url}/v3/device/control`;
-  const res = await axios.post(url, { deviceId, properties }, { headers });
   return res.data;
 }
 
@@ -122,8 +167,8 @@ app.get('/ac/on', auth, async (req, res) => {
     if (!deviceId) return res.status(400).json({ error: 'device_id gerekli' });
     const result = await sendCommand(deviceId, {
       powerSwitch: 1,
-      workMode: parseInt(req.query.mode || 0),
-      temperature: parseInt(req.query.temp || 24),
+      workMode: parseInt(req.query.mode || 1),
+      targetTemperature: parseInt(req.query.temp || 24),
     });
     res.json({ ok: true, result });
   } catch (e) { console.error(e.message); res.status(500).json({ error: e.message }); }
@@ -142,7 +187,7 @@ app.get('/ac/temp', auth, async (req, res) => {
   try {
     const deviceId = req.query.device_id || process.env.TCL_DEVICE_ID;
     if (!deviceId || !req.query.value) return res.status(400).json({ error: 'device_id ve value gerekli' });
-    const result = await sendCommand(deviceId, { temperature: parseInt(req.query.value) });
+    const result = await sendCommand(deviceId, { targetTemperature: parseInt(req.query.value) });
     res.json({ ok: true, result });
   } catch (e) { console.error(e.message); res.status(500).json({ error: e.message }); }
 });
@@ -151,8 +196,8 @@ app.get('/ac/mode', auth, async (req, res) => {
   try {
     const deviceId = req.query.device_id || process.env.TCL_DEVICE_ID;
     if (!deviceId) return res.status(400).json({ error: 'device_id gerekli' });
-    const modeMap = { cool: 0, dry: 1, fan: 2, heat: 3, auto: 4 };
-    const result = await sendCommand(deviceId, { workMode: modeMap[req.query.value] ?? 0 });
+    const modeMap = { auto: 0, cool: 1, dry: 2, fan: 3, heat: 4 };
+    const result = await sendCommand(deviceId, { workMode: modeMap[req.query.value] ?? 1 });
     res.json({ ok: true, result });
   } catch (e) { console.error(e.message); res.status(500).json({ error: e.message }); }
 });
