@@ -228,9 +228,14 @@ app.get('/ac/status', auth, async (req, res) => {
     res.json({
       ok: true,
       power: state.powerSwitch === 1 ? 'açık' : 'kapalı',
-      temp: state.targetTemperature,
+      targetTemp: state.targetTemperature,
+      currentTemp: state.currentTemperature ?? null,
       mode: modeMap[state.workMode] || 'bilinmiyor',
-      fanSpeed: state.fanSpeed ?? null,
+      fanSpeed: state.windSpeed7Gear ?? null,
+      fanSpeedPercent: state.windSpeedPercentage ?? null,
+      sleep: state.sleep === 1 ? 'açık' : 'kapalı',
+      screen: state.screen === 1 ? 'açık' : 'kapalı',
+      errorCode: state.errorCode?.length > 0 ? state.errorCode : null,
       raw: state
     });
   } catch (e) { console.error(e.message); res.status(500).json({ error: e.message }); }
