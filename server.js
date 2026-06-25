@@ -20,8 +20,8 @@ let authData = null;
 let cloudUrlsData = null;
 let refreshTokensData = null;
 let awsCredentials = null;
+let awsCredentialsExpiry = 0;
 let iotData = null;
-let saasToken = null;
 let tokenExpiry = 0;
 
 function md5(input) {
@@ -85,14 +85,18 @@ async function getRefreshTokens() {
   const res = await axios.post(url, payload, { headers });
   if (!res.data || res.data.code !== 0) throw new Error('Token alınamadı: ' + JSON.stringify(res.data));
   refreshTokensData = res.data;
-  saasToken = res.data.data.saasToken;
   tokenExpiry = Date.now() + 3500 * 1000;
   console.log('SaasToken alındı');
   return refreshTokensData;
 }
 
 async function getAwsCredentials() {
-  if (awsCredentials) return awsCredentials;
+  if (awsCredentials && Date.now() < awsCredentialsExpiry) return awsCredentials;
+
+  // Credentials expire olmuşsa iotData'yı da sıfırla
+  awsCredentials = null;
+  iotData = null;
+
   const tokens = await getRefreshTokens();
   const urls = await getCloudUrls();
   const region = urls.cloud_region;
@@ -110,6 +114,7 @@ async function getAwsCredentials() {
   };
   const res = await axios.post(url, payload, { headers });
   awsCredentials = res.data;
+  awsCredentialsExpiry = Date.now() + 50 * 60 * 1000; // 50 dakika
   console.log('AWS credentials alındı');
   return awsCredentials;
 }
