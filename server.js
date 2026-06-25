@@ -139,6 +139,12 @@ async function sendCommand(deviceId, properties) {
   return { ok: true };
 }
 
+async function getShadow(deviceId) {
+  const iot = await getIotData();
+  const data = await iot.getThingShadow({ thingName: deviceId }).promise();
+  return JSON.parse(data.payload);
+}
+
 async function getDevices() {
   const urls = await getCloudUrls();
   const tokens = await getRefreshTokens();
@@ -187,7 +193,10 @@ app.get('/ac/temp', auth, async (req, res) => {
   try {
     const deviceId = req.query.device_id || process.env.TCL_DEVICE_ID;
     if (!deviceId || !req.query.value) return res.status(400).json({ error: 'device_id ve value gerekli' });
-    const result = await sendCommand(deviceId, { targetTemperature: parseInt(req.query.value) });
+    const temp = parseInt(req.query.value);
+    if (isNaN(temp) || temp < 16 || temp > 32)
+      return res.status(400).json({ error: 'Sıcaklık 16-32 arasında olmalı' });
+    const result = await sendCommand(deviceId, { targetTemperature: temp });
     res.json({ ok: true, result });
   } catch (e) { console.error(e.message); res.status(500).json({ error: e.message }); }
 });
@@ -197,8 +206,49 @@ app.get('/ac/mode', auth, async (req, res) => {
     const deviceId = req.query.device_id || process.env.TCL_DEVICE_ID;
     if (!deviceId) return res.status(400).json({ error: 'device_id gerekli' });
     const modeMap = { auto: 0, cool: 1, dry: 2, fan: 3, heat: 4 };
-    const result = await sendCommand(deviceId, { workMode: modeMap[req.query.value] ?? 1 });
+    const mode = req.query.value?.toLowerCase();
+    if (!(mode in modeMap)) return res.status(400).json({ error: 'Geçersiz mod. Seçenekler: auto, cool, dry, fan, heat' });
+    const result = await sendCommand(deviceId, { workMode: modeMap[mode] });
     res.json({ ok: true, result });
+  } catch (e) { console.error(e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.get('/ac/status', auth, async (req, res) => {
+  try {
+    const deviceId = req.query.device_id || process.env.TCL_DEVICE_ID;
+    if (!deviceId) return res.status(400).json({ error: 'device_id gerekli' });
+    const shadow = await getShadow(deviceId);
+    const state = shadow.state.reported;
+    const modeMap = ['auto', 'cool', 'dry', 'fan', 'heat'];
+    res.json({
+      ok: true,
+      power: state.powerSwitch === 1 ? 'açık' : 'kapalı',
+      temp: state.targetTemperature,
+      mode: modeMap[state.workMode] || 'bilinmiyor',
+      fanSpeed: state.fanSpeed ?? null,
+      raw: state
+    });
+  } catch (e) { console.error(e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.get('/ac/timer', auth, async (req, res) => {
+  try {
+    const deviceId = req.query.device_id || process.env.TCL_DEVICE_ID;
+    const minutes = parseInt(req.query.minutes);
+    const action = req.query.action || 'off';
+    if (!deviceId) return res.status(400).json({ error: 'device_id gerekli' });
+    if (!minutes || isNaN(minutes) || minutes < 1 || minutes > 1440)
+      return res.status(400).json({ error: 'minutes 1-1440 arası olmalı' });
+    if (!['on', 'off'].includes(action))
+      return res.status(400).json({ error: 'action on veya off olmalı' });
+    const command = action === 'on' ? { powerSwitch: 1 } : { powerSwitch: 0 };
+    res.json({ ok: true, message: `${minutes} dakika sonra klima ${action === 'on' ? 'açılacak' : 'kapanacak'}` });
+    setTimeout(async () => {
+      try {
+        await sendCommand(deviceId, command);
+        console.log(`Timer tamamlandı: ${deviceId} → ${action}`);
+      } catch (e) { console.error('Timer komutu başarısız:', e.message); }
+    }, minutes * 60 * 1000);
   } catch (e) { console.error(e.message); res.status(500).json({ error: e.message }); }
 });
 
